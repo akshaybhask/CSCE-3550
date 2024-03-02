@@ -1,71 +1,77 @@
-from flask import Flask, jsonify, request
-from cryptography.hazmat.backends import default_backend
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric import rsa
+from flask import Flask, request, jsonify, abort
 from datetime import datetime, timedelta
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.backends import default_backend
 import jwt
-import uuid
+import base64
 
 app = Flask(__name__)
 
-# Function to generate RSA key pair
-def generate_rsa_key_pair():
-    private_key = rsa.generate_private_key(
-        public_exponent=65537,
-        key_size=2048,
-        backend=default_backend()
-    )
+# Dictionary to store keys and their expiry time
+keys = {}
+
+def generate_rsa_key(expired=False):
+    #generates the RSA key pair
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048, backend=default_backend())
     public_key = private_key.public_key()
+    key_id = str(len(keys) + 1)
+    #if the keys are expired then the expiry time is set to 1 minute in the past making them immediately expired.
+    if expired:
+        expiration_time = datetime.utcnow() - timedelta(minutes=1)
+    else:
+        expiration_time = datetime.utcnow() + timedelta(minutes=5)
+
+    keys[key_id] = (public_key, private_key, expiration_time, expired)
+    return key_id
     
-    # Serialize keys to PEM format
-    private_pem = private_key.private_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PrivateFormat.TraditionalOpenSSL,
-        encryption_algorithm=serialization.NoEncryption()
-    )
-    public_pem = public_key.public_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PublicFormat.SubjectPublicKeyInfo
-    )
-    
-    return private_pem.decode('utf-8'), public_pem.decode('utf-8')
+def base64_encode(number):
+    #converts n (public key mmodulus) into base64 encoded value
+    byte_length = (number.bit_length() + 7) // 8
+    byte_array = number.to_bytes(byte_length, 'big')
+    base64url_str = base64.urlsafe_b64encode(byte_array).decode('utf-8')
+    return base64url_str.rstrip('=')  
 
-# Generate initial key pair
-private_key, public_key = generate_rsa_key_pair()
-
-# Key metadata including kid, expiration time, and algorithm
-key_metadata = {
-    'kid': str(uuid.uuid4()),
-    'exp': int((datetime.utcnow() + timedelta(days=30)).timestamp()),
-    'alg': 'RS256'
-}
-
-# Route to serve JWKS endpoint
-@app.route('/jwks', methods=['GET'])
+#jwks endpoint
+@app.route('/.well-known/jwks.json', methods=['GET'])
 def jwks():
-    if datetime.utcnow().timestamp() > key_metadata['exp']:
-        # Regenerate key pair if expired
-        global private_key, public_key, key_metadata
-        private_key, public_key = generate_rsa_key_pair()
-        key_metadata = {
-            'kid': str(uuid.uuid4()),
-            'exp': int((datetime.utcnow() + timedelta(days=30)).timestamp()),
-            'alg': 'RS256'
-        }
-    return jsonify({'keys': [key_metadata]})
+    # Serves the JWKS, excluding expired keys
+    jwks_keys = []
+    now = datetime.utcnow()
+    for kid, (public_key, _, expiration_time, expired) in keys.items():
+        if now <= expiration_time and not expired:
+            public_numbers = public_key.public_numbers()
+            jwks_keys.append({
+                "kid": kid,
+                "kty": "RSA",
+                "alg": "RS256",
+                "use": "sig",
+                "n": base64_encode(public_numbers.n),
+                "e": "AQAB"
+            })
+    return jsonify(keys=jwks_keys)
 
-# Route to serve authentication endpoint
+#auth endpoint
 @app.route('/auth', methods=['POST'])
 def authenticate():
-    expired = 'expired' in request.args and request.args['expired'] == 'true'
-    key_to_use = key_metadata if not expired else {
-        'kid': key_metadata['kid'],
-        'exp': int((datetime.utcnow() - timedelta(days=30)).timestamp()),  # Expired key
-        'alg': 'RS256'
-    }
+    #JWT is generated
+    expired = request.args.get('expired', 'false').lower() == 'true'
+    key_id = generate_rsa_key(expired=expired)
 
-    token = jwt.encode({}, private_key, algorithm='RS256', headers={'kid': key_to_use['kid']})
-    return jsonify({'token': token})
+    private_key = keys[key_id][1]
+    
+    if expired:
+        expiration_time = datetime.utcnow() - timedelta(minutes=1)
+    else:
+        expiration_time = datetime.utcnow() + timedelta(minutes=2)
+
+    payload = {'username': 'ab2165', 'exp': expiration_time}
+
+    try:
+        token = jwt.encode(payload, private_key, algorithm='RS256', headers={'kid': key_id})
+        return jsonify(token=token)
+    except Exception as e:
+        print(e)
+        abort(404, "Valid key not found")
 
 if __name__ == '__main__':
-    app.run(port=8080, debug=True)
+    app.run(port=8080)
